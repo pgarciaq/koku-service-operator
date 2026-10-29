@@ -135,7 +135,7 @@
 - **Operator upload:** use a mock token endpoint to issue a service access token with the API audience and configured scope, send an upload through Envoy to Ingress, and verify identity/tenant/account mapping. The service identity never receives the human admin role.
 - **Tenant isolation:** two tenant fixtures cannot read each other’s data; an Entra `tid` maps as `org_id` with hyphens stripped, only under the documented one-to-one mapping.
 - **Failure:** wrong issuer/audience, ID token instead of API access token, invalid signature, expired token, missing org/account mapping, invalid TLS, and RBAC unavailable all fail according to the fail-closed contract.
-- **Keycloak profile:** a Keycloak realm configured through the generic OIDC fields (Keycloak issuer/JWKS/audiences, `realm_access.roles` claim path, access-token mappers) passes the same login, API-audience, admin-role, and upload checks as Entra; old `spec.auth.keycloak` CRs are rejected with a message naming `spec.auth.oidc`.
+- **Keycloak profile:** a Keycloak realm configured through the generic OIDC fields (Keycloak issuer/JWKS/audiences, `realm_access.roles` claim path, access-token mappers, dedicated API audience distinct from the UI client_id) passes the same login, API-audience, admin-role, and upload checks as Entra; old `spec.auth.keycloak` CRs are rejected with a message naming `spec.auth.oidc`.
 
 ## Provider Conformance Matrix for Tests
 
