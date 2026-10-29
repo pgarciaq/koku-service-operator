@@ -25,6 +25,8 @@ OpenShift’s Entra login for the console and cluster API is configured independ
 ## Goals
 
 - Remove the required Keycloak-specific integration/configuration for Cost Management on-prem. The current operator does not deploy Keycloak; it requires customers to supply a Keycloak-compatible endpoint.
+- Replace (not migrate) the operator CRD auth fields: the operator is unreleased, so `spec.auth.keycloak` is deleted outright. Keycloak stays a supported on-prem IDP configured through the same generic OIDC fields.
+- Leave Cost Management SaaS (console.redhat.com) behavior completely untouched; this feature only changes on-prem deployments managed by the operator.
 - Configure standards-based external OIDC issuers without Keycloak-specific URL, realm, endpoint, or claim assumptions.
 - Preserve browser login, API authentication, Metrics Operator uploads, and the current full organization-admin experience.
 - Preserve the `X-Rh-Identity` contract so backend services do not implement provider-specific token validation.
@@ -38,11 +40,12 @@ OpenShift’s Entra login for the console and cluster API is configured independ
 - Reconfiguring the OpenShift cluster’s own OAuth/identity-provider configuration.
 - Importing arbitrary Entra groups as Cost Management permissions. Only the configured organization-admin app role maps to the existing admin-default behavior; other permissions remain assigned through Insights RBAC.
 - Implementing SCIM or per-provider directory-sync APIs inside the OIDC authentication change. Provisioning is not defined by OIDC and should be tracked separately if automated pre-provisioning is required across providers.
-- Supporting multiple unrelated issuers in one deployment in the first iteration unless required by the issue’s acceptance criteria.
+- Supporting multiple unrelated issuers in one deployment in the first iteration unless required by the issue’s acceptance criteria. Locked rule: the browser flow and the Metrics Operator flow always share the deployment’s single IDP.
+- Changing SaaS behavior in any way: `koku-metrics-operator` keeps `api.console` as its default scope because it is released and serves SaaS.
 
 ## Current State and Verified Findings
 
-The implementation target is **`koku-service-operator`**. Its README describes it as the operator for the on-prem stack. The live SNO deployment uses the `cost-onprem-chart` Helm chart; that chart is the deployment baseline, not the COST-8520 implementation owner.
+The implementation target is **`koku-service-operator`**. Its README describes it as the operator for the on-prem stack. The live SNO deployment uses the `cost-onprem-chart` Helm chart; that chart is deprecated and is baseline evidence only, never an edit target. Implementation owner is `koku-service-operator`.
 
 Current operator and live-deployment behavior:
 
@@ -75,7 +78,7 @@ OIDC standardizes authentication and discovery, but it does not guarantee identi
 
 | Provider | User identity / org claims | Admin-role signal | Principal provisioning | Metrics Operator token flow | Initial compatibility note |
 |---|---|---|---|---|---|
-| **Keycloak (current baseline)** | Realm-specific issuer; protocol mappers supply `org_id`, `account_number`, username, and email. | Realm role `org-admin` appears in the token and maps to `is_org_admin`; the similarly named `org-admin` subgroup does not grant admin access. | Optional 15-minute Keycloak Admin API sync creates RBAC Principals from top-level organization groups; it does not assign admin permissions. | Client credentials with hardcoded `api.console` scope; the token URL is configurable in the Metrics Operator CR. | Reference behavior for migration only; external OIDC must not require Keycloak. |
+| **Keycloak (supported on-prem IDP)** | Realm-specific issuer; protocol mappers supply `org_id`, `account_number`, username, and email on access tokens. | Realm role `org-admin` appears in the token and maps to `is_org_admin`; the similarly named `org-admin` subgroup does not grant admin access. | Optional 15-minute Keycloak Admin API sync creates RBAC Principals from top-level organization groups; it does not assign admin permissions. | Client credentials with `api.console` scope (the KMO default); the token URL is configurable in the Metrics Operator CR. | Supported from the start as a generic OIDC profile; external OIDC deployments must not require Keycloak. |
 | **Microsoft Entra ID** | Tenant-specific issuer; `tid` and stable `oid` are available. `org_id=tid` only under the one-tenant-to-one-Cost-Management-org model; configure `account_number` separately. | Assign a security group an API app role; map the resulting `roles` value to `is_org_admin`. | Entra Graph adapter is provider-specific; SCIM is the cross-provider follow-up. | OAuth client credentials with API `/.default` application permission. | First end-to-end target. |
 | **Okta** | Issuer is tied to the Okta org/authorization server. Do not assume the access-token `sub` is immutable; configure and verify a stable user-ID claim. Organization/account mapping is deployment-configured or claim-mapped. | A custom authorization server can issue configured group/custom claims; configure the expected claim/value. | Okta API adapter or SCIM; not part of OIDC itself. | Custom authorization server/client-credentials scope and API audience must be configured and tested. | Strong candidate for full support after its access-token and grant configuration is validated. |
 | **Ping Identity** | Issuer, subject, and custom claims depend on the configured Ping product/authorization server; explicitly map stable subject and tenant/account. | Configure an API access-token claim carrying the approved admin-role value; do not assume a standard group claim. | SCIM or a separate Ping directory/API adapter; not part of OIDC itself. | Confirm the selected Ping authorization server supports the required client-credentials grant and API audience. | Candidate; validate the exact Ping product and profile before claiming support. |
@@ -165,7 +168,7 @@ No separate first-admin database bootstrap is required for the current admin-def
 
 ### `org_id`
 
-Recommended for an initial single-tenant deployment: map the validated Entra `tid` claim to Koku `org_id`, provided one Entra tenant corresponds to exactly one Cost Management organization. A tenant GUID is 36 characters and fits Koku’s current field; Koku forms the schema as `org<tid>`.
+Recommended for an initial single-tenant deployment: map the validated Entra `tid` claim to Koku `org_id` with hyphens stripped (32 lowercase hex chars), provided one Entra tenant corresponds to exactly one Cost Management organization. Rationale: the stripped value stays unique, fits Koku’s 36-char field with room to spare, and forms a schema name (`org<32hex>`) that is a safe unquoted Postgres identifier — unlike `org<guid-with-hyphens>`, which would require quoting in every raw-SQL path. The gateway must strip hyphens deterministically so RBAC principal matching and the future SCIM follow-up use the identical key.
 
 If one Entra tenant must represent multiple Cost Management organizations, or one Cost Management organization spans multiple Entra tenants, use an explicit trusted mapping instead of `tid` directly.
 
@@ -175,7 +178,7 @@ The gateway currently requires `account_number` separately from `org_id`. Provid
 
 ### User identity and RBAC principal key
 
-The identity-header username used by Koku and the username used by RBAC principal provisioning must match exactly. Recommended Entra mapping: use immutable Entra `oid` as the canonical principal key; preserve `preferred_username`/email separately for display. For other providers, configure and verify a stable subject/user-ID claim rather than assuming `sub` or email is immutable. Confirm compatibility with current RBAC and UI behavior before implementation.
+The identity-header username used by Koku and the username used by RBAC principal provisioning must match exactly. DECIDED Entra mapping: use immutable Entra `oid` as the canonical principal key; preserve `preferred_username`/email separately for display. For other providers, configure and verify a stable subject/user-ID claim rather than assuming `sub` or email is immutable. No migration concern: the operator is unreleased.
 
 ## Configuration Changes (Illustrative)
 
@@ -183,12 +186,13 @@ Final CRD field names are implementation decisions; the API should describe gene
 
 ### `koku-service-operator`
 
-- Replace or migrate `spec.auth.keycloak` to provider-neutral OIDC configuration: issuer URL, explicit JWKS URI (or discovery support), accepted audiences, TLS CA settings, UI client secret reference, claim mapping, and admin-role claim/value.
-- Configure oauth2-proxy for generic OIDC (`provider=oidc`) with authorization-code/PKCE, issuer discovery, redirect URI, delegated API scope, access-token forwarding, secure cookies, and provider CA trust. Nginx must explicitly forward the access-token header to Envoy.
+- Delete `spec.auth.keycloak` and add provider-neutral `spec.auth.oidc`: issuer URL, explicit JWKS URI (or discovery support), accepted audiences, TLS CA settings, UI client secret reference, claim mapping, and admin-role claim/value. No translation layer for old CRs: the operator is unreleased, so old CRs are rejected with a message naming `spec.auth.oidc`.
+- Configure oauth2-proxy for generic OIDC (`provider=oidc`) with authorization-code/PKCE, issuer discovery, redirect URI, delegated API scope, explicit session email-claim mapping (Entra rarely emits `email`), access-token forwarding, secure cookies, and provider CA trust. Nginx must explicitly forward the access-token header to Envoy.
 - Configure Envoy JWT authentication to read the UI access-token header and the Metrics Operator bearer token, with exact issuer, JWKS URI, audience(s), and role claim mapping. Do not derive Keycloak’s `/realms/{realm}/protocol/openid-connect/certs` path for arbitrary providers.
 - Preserve `is_org_admin` mapping to the complete admin-default bundle and keep `ENHANCED_ORG_ADMIN=False` so Koku still consults Insights RBAC.
-- Keep principal provisioning separate from authentication. Do not replace `spec.rbac.keycloakSync` with an Entra-only Graph adapter inside this OIDC-only issue. The external OIDC path must work with Keycloak sync disabled; retain/deprecate the legacy sync separately and track SCIM/provider-neutral provisioning as a follow-up for customers who need pre-provisioning.
-- Preserve the existing `X-Rh-Identity` output and network boundary around backend services.
+- Keep principal provisioning separate from authentication. Do not replace `spec.rbac.keycloakSync` with an Entra-only Graph adapter inside this OIDC-only issue. The external OIDC path must work with Keycloak sync disabled; retain the sync as a separately gated Keycloak-only capability and track SCIM/provider-neutral provisioning as a follow-up for customers who need pre-provisioning.
+- Preserve the existing `X-Rh-Identity` output and network boundary around backend services. Drop `X-Bearer-Token` forwarding (verified: no on-prem reader).
+- Document Keycloak as a first-class OIDC profile: same generic CR shape plus the Keycloak-side checklist (protocol mappers for `org_id`/`account_number`/roles on access tokens, accepted access-token audience, explicit `end_session_endpoint`).
 
 ### `koku-metrics-operator`
 
@@ -204,7 +208,7 @@ Final CRD field names are implementation decisions; the API should describe gene
 - **Insights Ingress and ROS:** no direct provider-specific JWT validation if they keep receiving the normalized identity contract; verify their existing RBAC calls and identity handling in integration tests.
 - **koku-ui:** likely no production auth-code change; the operator-managed OAuth proxy supplies the session/API token. Verify `/api/me`, logout, and embedded User Access UI behavior with provider claims.
 - **OpenShift OAuth:** configure Entra for the cluster separately; it is outside this operator feature.
-- **`cost-onprem-chart`:** reference/prototype only; implementation target is `koku-service-operator`.
+- **`cost-onprem-chart`:** deprecated; never an edit target. The live SNO chart deployment is baseline evidence only. Implementation target is `koku-service-operator`.
 
 ## Security and Failure Behavior
 
@@ -218,10 +222,10 @@ Final CRD field names are implementation decisions; the API should describe gene
 
 ## Acceptance Criteria
 
-1. The operator-managed deployment can run with Entra without requiring a Keycloak deployment, Keycloak CR, realm, or Keycloak Admin API. The Keycloak UI path, when retained as a provider, uses the same API-audience access-token contract. Each additional provider is labeled full-stack supported only after passing the provider conformance checks below; OIDC login alone is not sufficient.
+1. The operator-managed deployment can run with Entra without requiring a Keycloak deployment, Keycloak CR fields, realm, or Keycloak Admin API. Keycloak remains supported as a generic OIDC profile using the same API-audience access-token contract. Each additional provider is labeled full-stack supported only after passing the provider conformance checks below; OIDC login alone is not sufficient.
 2. A user can log into the Cost Management UI through generic OIDC; secure session, delegated API access-token forwarding (not ID-token forwarding), refresh, and logout work.
 3. Envoy accepts correctly issued API access tokens for configured issuer/audience and rejects ID tokens, bad signature, issuer, audience, expiry, or missing required identity fields.
-4. Configured Entra `tid` maps to the expected `org_id`; `account_number` comes from its explicit configured source; Koku uses the expected isolated tenant schema.
+4. Configured Entra `tid` maps to the expected `org_id` with hyphens stripped (32 hex chars); `account_number` comes from its explicit configured source; Koku uses the expected isolated tenant schema.
 5. A user assigned the Entra organization-admin app role receives `is_org_admin=true`; Insights RBAC grants the complete existing admin-default bundle (Cost Management, User Access/RBAC, Sources, and currently seeded platform admin roles). A user without the claim does not receive that bundle.
 6. Removing a user from the Entra admin group/role removes admin-default access on newly issued tokens; document/verify provider propagation, token lifetime, and RBAC cache TTL in the effective revocation bound.
 7. An externally authenticated non-admin user with an existing/pre-provisioned Insights RBAC principal receives the same RBAC permissions and resource filters as today.
@@ -233,12 +237,12 @@ Final CRD field names are implementation decisions; the API should describe gene
 
 1. **Pre-provisioning parity:** COST-8520 remains OIDC-only. The optional Keycloak principal sync is not portable; track provider-neutral SCIM 2.0 as a separate follow-up/dependency before retiring that capability for customers who rely on it.
 2. **Account number:** what trusted value supplies `account_number` for each Entra tenant? Keep it distinct from `tid` by default.
-3. **Canonical principal identifier:** proposed SCIM/RBAC key is Entra `oid`, mapped consistently into `X-Rh-Identity`; verify UI/display impacts before the provisioning follow-up.
+3. **Canonical principal identifier:** DECIDED — Entra `oid` is the SCIM/RBAC key, mapped consistently into `X-Rh-Identity`; display username/email stay separate. No migration needed (operator unreleased).
 4. **Entra app registration contract:** decide the API Application ID URI/audience, UI delegated API scope, operator application role, and admin app-role value. These must produce the audience and claims Envoy validates.
 5. **OIDC discovery:** use configured issuer plus explicit JWKS URI (recommended for predictable Envoy config) or add provider discovery during reconciliation; confirm behavior with private CA and disconnected deployments.
 6. **Provider compatibility:** define the minimum supported OIDC claims and how Okta/Ping configurations map their role claim names/values to the same admin claim contract.
 7. **Logout behavior:** whether logout should end only the local oauth2-proxy session or also redirect through an optional provider end-session endpoint.
-8. **Legacy configuration:** whether the new generic OIDC fields should transparently accept existing Keycloak settings during an upgrade, or require a one-time CR migration. This concerns configuration migration only; it does not change the access-token target or preserve ID-token API authentication.
+8. **Legacy configuration:** DECIDED — no backwards compatibility. `spec.auth.keycloak` is deleted; Keycloak is configured through the generic `spec.auth.oidc` fields (Keycloak profile). Old CRs are rejected with a message naming the new fields.
 
 ## Relevant Current Code
 
