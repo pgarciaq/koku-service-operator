@@ -15,7 +15,7 @@
 - COST-8520 changes external authentication only; Insights RBAC remains the authorization engine.
 - Preserve the full existing admin-default permission bundle: Cost Management, User Access/RBAC, Sources, and currently seeded platform admin roles.
 - `ENHANCED_ORG_ADMIN` remains false; admin identity must not bypass Insights RBAC.
-- Proposed target: Envoy validates a Cost Management API **access token** for UI API requests. The current SNO Keycloak UI path appears to forward an OIDC ID token instead; preserve/migrate behavior only after the baseline characterization below is reviewed.
+- Decision: Envoy validates a Cost Management API **access token** for UI API requests, matching the token category used at the Hybrid Cloud Console API boundary. Migrate the current Keycloak UI path to this contract; its observed ID-token behavior is a baseline to characterize, not a mode to preserve.
 - Backend services continue receiving the existing `X-Rh-Identity` contract; caller-provided identity headers are not trusted.
 - Entra `tid` maps to `org_id` only under the one-Entra-tenant-to-one-Cost-Management-org assumption; `account_number` is mapped independently.
 - SCIM/Graph principal provisioning is not implemented or tested in this plan. Integration tests seed or provision RBAC Principals through an already-supported test/setup path.
@@ -23,16 +23,16 @@
 
 ## Current Keycloak Baseline (SNO, read-only check)
 
-- The live `cost-onprem-ui` oauth2-proxy is v7.6.0 and runs `--provider=keycloak-oidc` plus `--pass-authorization-header`; it does **not** set `--pass-access-token`.
+- The live SNO deployment is installed from `cost-onprem-chart` (the deployment baseline, not the COST-8520 implementation repo). Its `cost-onprem-ui` oauth2-proxy is v7.6.0 and runs `--provider=keycloak-oidc` plus `--pass-authorization-header`; it does **not** set `--pass-access-token`.
 - oauth2-proxy v7.6.0 documents `--pass-authorization-header` as forwarding the OIDC **ID token** in `Authorization`; `--pass-access-token` forwards the OAuth access token separately in `X-Forwarded-Access-Token`.
 - The live Envoy JWT filter reads the default bearer `Authorization` header and accepts audiences including `cost-management-ui`, `cost-management-operator`, and `account`.
 - A controlled direct-grant comparison using the UI client found that both returned tokens had `org_id`, `account_number`, and the `org-admin` role; both separately received HTTP 200 from the read-only Koku `user-access` endpoint. Only claim summaries and status codes were retained; raw tokens were not printed or saved. This was **not** a browser authorization-code capture, so the proxy flag semantics plus a browser/E2E check should confirm the exact live header.
-- The Keycloak install guide says Envoy reads the access token and its protocol-mapper instructions set the required claims on access tokens. This conflicts with the oauth2-proxy flag’s documented ID-token behavior and should be treated as a design/migration decision, not assumed away.
+- The Keycloak install guide says Envoy reads the access token and its protocol-mapper instructions set the required claims on access tokens. This conflicts with the oauth2-proxy flag’s documented ID-token behavior. The decision is to migrate the UI path to API access tokens; tests must make that change explicit rather than assume the current flag already does it.
 - The live Metrics Operator CR uses `type: service-account` and the Keycloak token endpoint; its most recent status was `202 Accepted`. It also has `validate_cert: false`, which is a separate TLS-hardening concern to address by configuring trusted CA validation.
 
 ## Review Focus
 
-1. **Baseline token discrepancy:** the live SNO args use `--pass-authorization-header`; oauth2-proxy v7.6.0 documents that as forwarding the OIDC ID token, while the Keycloak install guide says Envoy reads the access token. Envoy currently reads bearer `Authorization`. The live ID and access token pair were both accepted by a read-only Koku endpoint; characterize the browser flow before changing it.
+1. **Baseline and migration:** the live SNO args use `--pass-authorization-header`; oauth2-proxy v7.6.0 documents that as forwarding the OIDC ID token, while the Keycloak install guide says Envoy reads the access token. The live ID and access token pair were both accepted by a read-only Koku endpoint. Preserve this as current-state evidence, then migrate the UI-to-API contract to an API-audience access token; do not retain ID-token acceptance as a compatibility path.
 2. UI proxy forwards an API-audience access token through nginx to Envoy; an ID token with the UI client audience must be rejected by the API gateway in the proposed target design.
 3. Provider-specific claim shapes must map to the same stable identity and fail closed when required org/account claims are absent or invalid.
 4. The Entra admin role must map to the full RBAC admin-default bundle; non-admin roles must remain scoped and must not inherit admin access.
@@ -86,7 +86,7 @@
 
 **Tests to write first:**
 
-- Add a token-forwarding characterization test for the current Keycloak UI deployment: it includes `--pass-authorization-header`, omits `--pass-access-token`, nginx does not explicitly forward an access-token header, and Envoy extracts JWTs from `Authorization`. Compare this with oauth2-proxy v7.6.0 flag semantics and `docs/install/keycloak.md`, which currently describes an access token.
+- Add a token-forwarding characterization test for the current SNO Keycloak UI deployment: it includes `--pass-authorization-header`, omits `--pass-access-token`, nginx does not explicitly forward an access-token header, and Envoy extracts JWTs from `Authorization`. Compare this with oauth2-proxy v7.6.0 flag semantics and `docs/install/keycloak.md`, which currently describes an access token. The live SNO chart is a baseline; implementation changes belong in `koku-service-operator`.
 - Before changing the behavior, perform a non-production token-flow check that records only decoded claim names/values (never raw tokens): determine whether the token reaching Envoy is an ID token or access token, its `aud`, and whether required `org_id`, `account_number`, and `org-admin` claims are present.
 - Preserve the SNO baseline observation as a fixture/assertion: the UI client’s ID token and access token both carried required identity/admin claims and both independently received HTTP 200 at the read-only `user-access` endpoint. This direct-grant probe is not a substitute for a browser authorization-code capture.
 - oauth2-proxy is configured with generic OIDC provider, issuer discovery, authorization-code/PKCE, delegated API scope, provider CA trust, secure cookies, and token refresh settings.
@@ -97,7 +97,7 @@
 
 **Integration assertion:** a browser-style request with a valid API access token traverses oauth2-proxy → nginx → Envoy and receives the expected `X-Rh-Identity`; an ID token does not pass as API authentication.
 
-**Migration decision:** static/runtime configuration and the direct-grant comparison indicate the UI path sends an ID token today. The implementation plan must explicitly decide whether to migrate Keycloak and external providers to API access tokens together, or preserve a documented legacy path. Do not silently change the token type or claim/audience contract.
+**Resolved migration decision:** migrate Keycloak and external OIDC UI flows together to the API-audience JWT access-token contract. Envoy rejects ID tokens for API access, including tokens whose audience is only the UI client. The implementation plan must specify the proxy/nginx token-forwarding path and any one-time configuration migration; it must not introduce a legacy ID-token acceptance mode. This matches the Console's access-token boundary while retaining the distinct on-prem oauth2-proxy → nginx → Envoy → `X-Rh-Identity` architecture.
 
 ### Workstream D: Metrics Operator scope and token request (`koku-metrics-operator`)
 
@@ -146,7 +146,7 @@
 1. Is Entra the only full-stack provider in the first release, with Okta/Ping as conformance candidates and Google login-only pending a machine-token strategy?
 2. Confirm `org_id=tid` only for one Entra tenant per Cost Management org; supply `account_number` independently per org.
 3. Confirm Entra `oid` as the stable RBAC identity key and the corresponding `X-Rh-Identity` username mapping.
-4. Resolve the current Keycloak UI token discrepancy from Workstream C and choose the migration/compatibility behavior.
+4. Specify the one-time configuration migration for existing Keycloak deployments; the token contract is resolved: Keycloak and external OIDC use API-audience access tokens, and ID tokens are rejected for API access.
 5. Decide whether old Keycloak CR configuration remains supported as a generic OIDC profile or requires an explicit migration.
 6. Confirm the Entra API audience, UI delegated scope, organization-admin app-role value, and Metrics Operator application permission/scope.
 7. Confirm SCIM remains a dependent follow-up and not part of COST-8520 implementation.

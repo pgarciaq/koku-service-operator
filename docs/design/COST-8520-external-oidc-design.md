@@ -5,6 +5,8 @@
 **Initial provider to validate:** Microsoft Entra ID
 **Scope:** Replace the required Keycloak-specific integration with configurable external OIDC; keep Insights RBAC.
 
+**UI API token decision:** The target is a JWT OAuth access token for the Cost Management API. This follows the token type used by the Hybrid Cloud Console at its API boundary. The current SNO Keycloak ID-token path is a verified baseline to migrate, not a compatibility target.
+
 ## Summary
 
 Allow Cost Management on-prem to authenticate through an externally managed OIDC provider—initially Microsoft Entra ID, with Okta, Ping Identity, and other compatible providers as targets—without requiring a Keycloak instance or Keycloak-specific configuration.
@@ -40,13 +42,13 @@ OpenShift’s Entra login for the console and cluster API is configured independ
 
 ## Current State and Verified Findings
 
-The implementation target is **`koku-service-operator`**. Its README describes it as the operator for the on-prem stack; `cost-onprem-chart` is reference/prototype material, not the current implementation owner.
+The implementation target is **`koku-service-operator`**. Its README describes it as the operator for the on-prem stack. The live SNO deployment uses the `cost-onprem-chart` Helm chart; that chart is the deployment baseline, not the COST-8520 implementation owner.
 
-Current operator behavior:
+Current operator and live-deployment behavior:
 
 - `spec.auth.keycloak` configures a Keycloak-shaped auth contract. Envoy derives a Keycloak JWKS URL, while oauth2-proxy uses `--provider=keycloak-oidc` and performs OIDC discovery from the issuer URL.
 - Envoy maps the Keycloak realm role `org-admin` to `is_org_admin: true` in `X-Rh-Identity`.
-- The current UI proxy passes an OIDC token upstream with `--pass-authorization-header`; the external-provider design must explicitly verify that Envoy receives an API **access token** for the Cost Management audience, not an ID token intended for the UI client.
+- The current SNO UI proxy passes an OIDC token upstream with `--pass-authorization-header`, which oauth2-proxy v7.6.0 documents as the **ID token**. The target is an API **access token** for the Cost Management audience, not an ID token intended for the UI client.
 - Koku runs with `ENHANCED_ORG_ADMIN=False`; it asks Insights RBAC for access. Insights RBAC applies its `admin_default` bundle when it sees `is_org_admin`.
 - The current admin-default bundle includes Cost Administrator (`cost-management:*:*`), User Access administrator (`rbac:*:*`), Sources administrator (`sources:*:*`), and other seeded platform admin roles. This full bundle must be preserved.
 - The optional `spec.rbac.keycloakSync` CronJob runs in the Insights RBAC container. It syncs members of top-level `org-{orgId}` Keycloak groups into RBAC Principals and can prune principals. The nested `org-admin` subgroup is only logged; it does **not** grant admin access. Admin access comes from the realm-role claim in the token.
@@ -54,6 +56,18 @@ Current operator behavior:
 - The Metrics Operator supports client-credentials token acquisition and a configurable token URL, but its request hardcodes `scope=api.console`.
 - Koku consumes `X-Rh-Identity`; `Customer.org_id` is limited to 36 characters and Koku prefixes it with `org` to form the tenant schema.
 - Insights Ingress consumes normalized `X-Rh-Identity` and its organization/account fields; it does not validate provider tokens itself.
+
+## Hybrid Cloud Console Auth Precedent and COST-8520 Decision
+
+The Console precedent supports the **access-token contract**, not a requirement to copy Console's complete auth infrastructure:
+
+- Insights Chrome's OIDC connector implements `auth.getToken()` from the OIDC user's `access_token`; its security guidance describes sending that value as `Authorization: Bearer <token>` to API endpoints.
+- Platform APIs expose the Bearer-token boundary through the Console API layer and deliver the normalized `X-Rh-Identity` contract to backend services such as Koku. Koku and Insights RBAC continue to authorize that identity; they do not need to become provider-specific OIDC clients.
+- COST-8520 uses the same token category at the UI-to-API boundary, but keeps the on-prem components: oauth2-proxy manages the browser session, forwards the API access token through nginx, and Envoy validates it and maps trusted claims to `X-Rh-Identity`.
+
+**Decision:** migrate the Keycloak UI path and configure external OIDC providers to use the same API-audience JWT access-token contract. The currently deployed SNO ID-token flow is characterization evidence only; it is not a legacy API-auth mode to preserve. Envoy must reject an ID token whose audience is only the UI client. This is an explicit migration because today's SNO flow has been observed to work with both token types, but that does not make the ID token the intended API credential.
+
+References: [Insights Chrome OIDC connector](https://github.com/RedHatInsights/insights-chrome/blob/master/src/auth/OIDCConnector/OIDCSecured.tsx), [Chrome security guidance](https://github.com/RedHatInsights/insights-chrome/blob/master/docs/security-guidelines.md), and [Inventory identity requirements](https://github.com/RedHatInsights/insights-host-inventory/blob/master/docs/index.md#identity-requirements).
 
 ## Provider Compatibility Profiles
 
@@ -204,14 +218,14 @@ Final CRD field names are implementation decisions; the API should describe gene
 
 ## Acceptance Criteria
 
-1. The operator-managed deployment can run with Entra without requiring a Keycloak deployment, Keycloak CR, realm, or Keycloak Admin API. Each additional provider is labeled full-stack supported only after passing the provider conformance checks below; OIDC login alone is not sufficient.
+1. The operator-managed deployment can run with Entra without requiring a Keycloak deployment, Keycloak CR, realm, or Keycloak Admin API. The Keycloak UI path, when retained as a provider, uses the same API-audience access-token contract. Each additional provider is labeled full-stack supported only after passing the provider conformance checks below; OIDC login alone is not sufficient.
 2. A user can log into the Cost Management UI through generic OIDC; secure session, delegated API access-token forwarding (not ID-token forwarding), refresh, and logout work.
 3. Envoy accepts correctly issued API access tokens for configured issuer/audience and rejects ID tokens, bad signature, issuer, audience, expiry, or missing required identity fields.
 4. Configured Entra `tid` maps to the expected `org_id`; `account_number` comes from its explicit configured source; Koku uses the expected isolated tenant schema.
 5. A user assigned the Entra organization-admin app role receives `is_org_admin=true`; Insights RBAC grants the complete existing admin-default bundle (Cost Management, User Access/RBAC, Sources, and currently seeded platform admin roles). A user without the claim does not receive that bundle.
 6. Removing a user from the Entra admin group/role removes admin-default access on newly issued tokens; document/verify provider propagation, token lifetime, and RBAC cache TTL in the effective revocation bound.
 7. An externally authenticated non-admin user with an existing/pre-provisioned Insights RBAC principal receives the same RBAC permissions and resource filters as today.
-8. The Metrics Operator obtains a token with its configured resource scope and completes an upload through the gateway. Incorrect audience/scope is rejected.
+8. The Metrics Operator obtains a token with its configured resource scope and completes an upload through the gateway. Incorrect audience/scope is rejected. Its machine-to-machine grant remains separate from interactive UI authentication.
 9. Koku, ROS, Ingress, and the UI continue using the existing identity and RBAC contracts; RBAC User Access and delegation functionality is retained.
 10. Tests cover Entra role-claim mapping, generic OIDC claim mapping, invalid JWTs, admin-role addition/removal, and RBAC denial/allow behavior. Each provider marked full-stack supported must also pass API-token audience/claim and Metrics Operator grant/upload tests. Principal-provisioning tests belong to the SCIM/provider-provisioning follow-up.
 
@@ -224,7 +238,7 @@ Final CRD field names are implementation decisions; the API should describe gene
 5. **OIDC discovery:** use configured issuer plus explicit JWKS URI (recommended for predictable Envoy config) or add provider discovery during reconciliation; confirm behavior with private CA and disconnected deployments.
 6. **Provider compatibility:** define the minimum supported OIDC claims and how Okta/Ping configurations map their role claim names/values to the same admin claim contract.
 7. **Logout behavior:** whether logout should end only the local oauth2-proxy session or also redirect through an optional provider end-session endpoint.
-8. **Legacy configuration:** whether the new generic OIDC fields should transparently accept existing Keycloak settings during an upgrade, or require a one-time CR migration.
+8. **Legacy configuration:** whether the new generic OIDC fields should transparently accept existing Keycloak settings during an upgrade, or require a one-time CR migration. This concerns configuration migration only; it does not change the access-token target or preserve ID-token API authentication.
 
 ## Relevant Current Code
 
