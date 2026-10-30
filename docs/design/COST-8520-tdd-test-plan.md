@@ -145,7 +145,7 @@
 - **Okta:** full-stack only after a custom authorization server issues the API-audience JWT and configured role claim, and the Metrics Operator grant/audience is proven. Do not assume `sub` is immutable.
 - **Ping Identity:** test the exact product/profile; require API-audience JWT, stable user identity, admin claim, and client-credentials upload flow before claiming full support.
 - **Google Cloud Identity / Workspace:** OIDC user login may be testable, but standard tokens do not provide the same admin-role or API client-credentials behavior. Mark login-only until a supported role signal and Metrics Operator token flow are implemented and tested.
-- **SCIM/principal provisioning:** explicitly excluded from COST-8520 tests; tests use seeded RBAC Principals. A separate SCIM follow-up must test create/update/deactivate/delete and safe full-sync pruning.
+- **SCIM/principal provisioning:** explicitly excluded from COST-8520 tests; tests use seeded RBAC Principals. A separate SCIM follow-up must test create/update/deactivate/delete and safe full-sync pruning, plus org-affinity mapping and rejection of unmapped claims.
 
 ## Open Decisions to Lock Before the Implementation Plan
 

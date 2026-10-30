@@ -180,6 +180,10 @@ The gateway currently requires `account_number` separately from `org_id`. Provid
 
 The identity-header username used by Koku and the username used by RBAC principal provisioning must match exactly. DECIDED Entra mapping: use immutable Entra `oid` as the canonical principal key; preserve `preferred_username`/email separately for display. For other providers, configure and verify a stable subject/user-ID claim rather than assuming `sub` or email is immutable. No migration concern: the operator is unreleased.
 
+### Multi-org direction (follow-up, not in scope)
+
+If one IDP tenant must later serve several Cost Management organizations, the mechanism is the gateway-side mapping table above — not per-provider mapper hacks. Constraints, verified against current code: the data plane needs no changes (Koku keys customers, users, and RBAC lookups per `(org_id, username)` per request; Envoy already maps claims per token) — the table only adds mapping policy. The table doubles as the org allowlist, because Koku auto-creates unknown orgs on demand: no-match must be 401, or a misconfigured rule spawns tenants. Direct claim mapping stays the default forever; the table is exclusive only when present — no migration for single-org deployments. Match values are provider-specific: Keycloak group/attribute, Entra app-roles (one role per org, no overage) or group IDs (200+ memberships omit the claim, so group-based matching must fail closed), Okta/Ping group or role claims. Same human in two orgs holds two independent permission sets; there is no transitive access. SCIM provisioning gains an org-affinity dimension using the same normalization rules. Precedent: the Hybrid Cloud Console binds exactly one org per request server-side (3scale + account system + account switcher); the table is the on-prem equivalent of that enforcement point.
+
 ## Configuration Changes (Illustrative)
 
 Final CRD field names are implementation decisions; the API should describe generic OIDC concepts rather than name the provider `Keycloak`.
