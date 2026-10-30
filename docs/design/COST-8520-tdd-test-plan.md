@@ -56,8 +56,9 @@
 - Valid external OIDC settings accept issuer URL, JWKS URI, non-empty audience list, TLS settings, and claim mappings.
 - Invalid issuer scheme, malformed URLs, empty audience list, control characters/newlines, and missing required fields are rejected by CR/webhook validation.
 - A missing or malformed admin claim mapping does not silently make users administrators.
+- A service token carrying the configured marker maps to the service identity with `is_org_admin=false`; a user token presented on the Metrics Operator header (marker absent) is rejected and never receives the service identity (WHY: header position must not confer service identity).
 - A CR still using the deleted `spec.auth.keycloak` field is rejected with a message naming `spec.auth.oidc` (WHY: proves the break is explicit, not silent).
-- A Keycloak realm expressed as a generic OIDC profile (Keycloak issuer/JWKS/audiences, `realm_access.roles` claim path) validates with zero special-case code (WHY: proves Keycloak stays supported through the generic fields).
+- A Keycloak realm expressed as a generic OIDC profile (Keycloak issuer/JWKS/audiences including the dedicated API audience, `realm_access.roles` claim path) validates with zero special-case code (WHY: proves Keycloak stays supported through the generic fields).
 
 **Red/green verification:** run the focused validation test and confirm the new-schema cases fail before implementation. After implementation, run the focused test and then the operator suite. If CRD markers change, run `make generate manifests` and `make bundle`; verify generated trees rather than hand-editing them.
 
@@ -71,7 +72,7 @@
 
 - Generated Envoy YAML parses and contains configured issuer, JWKS URI, audiences, TLS validation, and accepted token sources: UI access-token header and Metrics Operator bearer `Authorization` header.
 - Entra fixture token with `roles` containing the configured admin role maps to `is_org_admin=true`; missing, unrelated, wrong-type, or case-variant role claims map to false (WHY exact match: prefix/case-insensitive matching would let crafted role strings escalate to admin).
-- Configured tenant claim maps to `org_id` with hyphens stripped (fixture `tid` `a1b2c3d4-e5f6-…` → `org_id` `a1b2c3d4e5f6…`); configured account mapping supplies `account_number`; Entra `oid` maps to the RBAC identity key while display email/username remains separate.
+- Configured tenant claim maps to `org_id` with hyphens stripped and lowercased (fixture `tid` `A1B2C3D4-E5F6-…` → `org_id` `a1b2c3d4e5f6…`); configured account mapping supplies `account_number`; Entra `oid` maps to the RBAC identity key verbatim (never normalized) while display email/username remains separate.
 - Missing/invalid tenant or account data fails closed with a 401 and does not use a shared/default tenant.
 - Envoy replaces an incoming forged `X-Rh-Identity` header with a header built from the validated token and configured mappings.
 - The backend request does NOT contain `X-Bearer-Token` (WHY: proves the forwarding removal; update the old `envoy_test.go` assertion rather than deleting it silently).
@@ -94,6 +95,7 @@
 - Preserve the SNO baseline observation as a fixture/assertion: the UI client’s ID token and access token both carried required identity/admin claims and both independently received HTTP 200 at the read-only `user-access` endpoint. This direct-grant probe is not a substitute for a browser authorization-code capture.
 - oauth2-proxy is configured with generic OIDC provider, issuer discovery, authorization-code/PKCE, delegated API scope, provider CA trust, secure cookies, and token refresh settings.
 - oauth2-proxy has an explicit session email-claim mapping for Entra (e.g. `preferred_username`), verified against the deployed proxy version's `--help`; a login flow with a token carrying no `email` claim still builds a session (WHY: Entra rarely emits `email`, and without a mapped claim every browser login fails before any API call).
+- Session refresh works against short-lived access tokens without re-login; for Entra this requires `offline_access` in scope (WHY: no refresh token is issued without it).
 - oauth2-proxy requests/forwards the API access token (e.g. `--pass-access-token`), not only the ID token.
 - nginx forwards the access-token header to Envoy without dropping or trusting a browser-supplied replacement; `/api/me` still returns the intended display username/email headers.
 - logout always clears the local proxy session; optional provider end-session behavior is tested only when configured/supported.
@@ -101,7 +103,7 @@
 
 **Integration assertion:** a browser-style request with a valid API access token traverses oauth2-proxy → nginx → Envoy and receives the expected `X-Rh-Identity`; an ID token does not pass as API authentication.
 
-**Resolved migration decision:** migrate Keycloak and external OIDC UI flows together to the API-audience JWT access-token contract. Envoy rejects ID tokens for API access, including tokens whose audience is only the UI client. The implementation plan must specify the proxy/nginx token-forwarding path and any one-time configuration migration; it must not introduce a legacy ID-token acceptance mode. This matches the Console's access-token boundary while retaining the distinct on-prem oauth2-proxy → nginx → Envoy → `X-Rh-Identity` architecture.
+**Resolved migration decision:** migrate Keycloak and external OIDC UI flows together to the API-audience JWT access-token contract. Envoy rejects ID tokens for API access, including tokens whose audience is only the UI client. The implementation plan must specify the proxy/nginx token-forwarding path and any Keycloak IDP-side mapper/audience updates for deployments adopting the Keycloak profile; it must not introduce a legacy ID-token acceptance mode. This matches the Console's access-token boundary while retaining the distinct on-prem oauth2-proxy → nginx → Envoy → `X-Rh-Identity` architecture.
 
 ### Workstream D: Metrics Operator scope and token request (`koku-metrics-operator`)
 
@@ -134,7 +136,7 @@
 - **Revocation:** remove admin app-role membership, issue a fresh token, and verify admin-default access is absent after provider propagation and the effective Koku/Insights RBAC cache bounds.
 - **Operator upload:** use a mock token endpoint to issue a service access token with the API audience and configured scope, send an upload through Envoy to Ingress, and verify identity/tenant/account mapping. The service identity never receives the human admin role.
 - **Tenant isolation:** two tenant fixtures cannot read each other’s data; an Entra `tid` maps as `org_id` with hyphens stripped, only under the documented one-to-one mapping.
-- **Failure:** wrong issuer/audience, ID token instead of API access token, invalid signature, expired token, missing org/account mapping, invalid TLS, and RBAC unavailable all fail according to the fail-closed contract.
+- **Failure:** wrong issuer/audience, ID token instead of API access token, user token presented on the service-token header, invalid signature, expired token, missing org/account mapping, invalid TLS, and RBAC unavailable all fail according to the fail-closed contract.
 - **Keycloak profile:** a Keycloak realm configured through the generic OIDC fields (Keycloak issuer/JWKS/audiences, `realm_access.roles` claim path, access-token mappers, dedicated API audience distinct from the UI client_id) passes the same login, API-audience, admin-role, and upload checks as Entra; old `spec.auth.keycloak` CRs are rejected with a message naming `spec.auth.oidc`.
 
 ## Provider Conformance Matrix for Tests

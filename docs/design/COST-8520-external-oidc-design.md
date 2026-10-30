@@ -118,7 +118,7 @@ Entra group membership changes are reflected when a new token is issued/refreshe
 
 1. The operator exchanges its client ID/secret for an access token using OAuth client credentials.
 2. The operator requests the configured API resource scope. For Entra this is typically the API Application ID URI plus `/.default`, e.g. `api://<api-application-id>/.default`.
-3. Envoy validates the service token’s issuer and API audience and maps its configured organization/account/service identity to `X-Rh-Identity` before routing the upload to Ingress.
+3. Envoy validates the service token’s issuer and API audience, verifies the configured service-token marker (proof the token is a machine client-credentials token, e.g. Entra `idtyp=app`), and maps its configured organization/account/service identity to `X-Rh-Identity` before routing the upload to Ingress.
 
 The API Application ID URI identifies the Cost Management API resource; it is not the token endpoint URL and is not the current Keycloak scope `api.console`. The operator app needs the API’s application permission/app role and tenant admin consent. This is a coarse machine-client-to-API permission; it does not replace human-user permissions in Insights RBAC. The gateway must accept the actual `aud` value issued for this API resource.
 
@@ -130,7 +130,7 @@ Client-credentials tokens do not inherently contain the business `org_id`, `acco
 
 For Entra, define an API application role such as `CostManagement.OrgAdmin` and assign the organization’s admin security group to that role. The user access token must contain the configured role value in its `roles` claim. Envoy maps that claim/value to `is_org_admin`.
 
-The Entra registration contract has three distinct pieces: (1) a Cost Management API resource/audience, (2) a delegated API scope requested by the UI OAuth client so the forwarded access token is for that API, and (3) an API app role assigned to the organization-admin group. The Metrics Operator uses a separate application app role granted to its client app. Entra v2 client-credentials requests use the API resource’s `/.default` scope; the UI uses a delegated scope, not `/.default`. If refresh-token-based sessions are required, configure `offline_access` if supported by the provider. Example names are illustrative; verify the actual token `aud` and claims before configuring Envoy.
+The Entra registration contract has three distinct pieces: (1) a Cost Management API resource/audience, (2) a delegated API scope requested by the UI OAuth client so the forwarded access token is for that API, and (3) an API app role assigned to the organization-admin group. The Metrics Operator uses a separate application app role granted to its client app. Entra v2 client-credentials requests use the API resource’s `/.default` scope; the UI uses a delegated scope, not `/.default`. For Entra, `offline_access` MUST be in `uiScopes`: without it Entra issues no refresh token, so cookie-based session refresh cannot work and users re-login at every access-token expiry. Keycloak issues refresh tokens under its default flow with no extra scope. Example names are illustrative; verify the actual token `aud` and claims before configuring Envoy.
 
 This mirrors the current Keycloak realm-role flow and preserves the complete current admin-default bundle, including Cost Management, User Access/RBAC, Sources, and other currently seeded roles. The admin role must not be reduced to Cost Management-only access.
 
@@ -168,9 +168,9 @@ No separate first-admin database bootstrap is required for the current admin-def
 
 ### `org_id`
 
-Recommended for an initial single-tenant deployment: map the validated Entra `tid` claim to Koku `org_id` with hyphens stripped (32 lowercase hex chars), provided one Entra tenant corresponds to exactly one Cost Management organization. Rationale: the stripped value stays unique, fits Koku’s 36-char field with room to spare, and forms a schema name (`org<32hex>`) that is a safe unquoted Postgres identifier — unlike `org<guid-with-hyphens>`, which would require quoting in every raw-SQL path. The gateway must strip hyphens deterministically so RBAC principal matching and the future SCIM follow-up use the identical key.
+Recommended for an initial single-tenant deployment: map the validated Entra `tid` claim to Koku `org_id` with hyphens stripped (32 lowercase hex chars), provided one Entra tenant corresponds to exactly one Cost Management organization. Rationale: the stripped value stays unique, fits Koku’s 36-char field with room to spare, and forms a schema name (`org<32hex>`) that is a safe unquoted Postgres identifier — unlike `org<guid-with-hyphens>`, which would require quoting in every raw-SQL path. Normalization is deterministic and profile-independent: the gateway strips hyphens and lowercases the tenant claim (already-lowercase values pass through unchanged), then validates the result against the identifier rules. The RBAC principal key is always the verbatim stable subject (`oid`) — never normalized. The SCIM follow-up must replicate both rules exactly.
 
-If one Entra tenant must represent multiple Cost Management organizations, or one Cost Management organization spans multiple Entra tenants, use an explicit trusted mapping instead of `tid` directly.
+Multi-org from one IDP tenant (several Cost Management organizations sharing one Entra tenant, or one organization spanning tenants) is explicitly out of scope: one deployment supports a single org mapping. Do NOT implement it with per-provider mapper hacks. The intended follow-up design is a gateway-side mapping table — an ordered list of match rules in the CR (`spec.auth.orgMapping`: claim path + value → `org_id` + `account_number`), compiled into the Envoy config and evaluated per request in Lua with first-match-wins and no-match → 401, mirroring the Console pattern where the gateway binds exactly one org per request from server-side data. When present the table is exclusive (it doubles as the org allowlist, so unmapped groups can never auto-provision tenants); when absent, direct claim mapping applies unchanged. Direct mapping stays the default forever so single-org deployments never require migration. Service tokens keep the single configured service identity regardless of the table.
 
 ### `account_number`
 
@@ -186,7 +186,7 @@ Final CRD field names are implementation decisions; the API should describe gene
 
 ### `koku-service-operator`
 
-- Delete `spec.auth.keycloak` and add provider-neutral `spec.auth.oidc`: issuer URL, explicit JWKS URI (or discovery support), accepted audiences, TLS CA settings, UI client secret reference, claim mapping, and admin-role claim/value. No translation layer for old CRs: the operator is unreleased, so old CRs are rejected with a message naming `spec.auth.oidc`.
+- Delete `spec.auth.keycloak` and add provider-neutral `spec.auth.oidc`: issuer URL, explicit JWKS URI (or discovery support), accepted audiences, TLS CA settings, UI client secret reference, claim mapping, admin-role claim/value, and a service-token marker (claim path + expected value, e.g. Entra `idtyp` = `app`). No translation layer for old CRs: the operator is unreleased, so old CRs are rejected with a message naming `spec.auth.oidc`.
 - Configure oauth2-proxy for generic OIDC (`provider=oidc`) with authorization-code/PKCE, issuer discovery, redirect URI, delegated API scope, explicit session email-claim mapping (Entra rarely emits `email`), access-token forwarding, secure cookies, and provider CA trust. Nginx must explicitly forward the access-token header to Envoy.
 - Configure Envoy JWT authentication to read the UI access-token header and the Metrics Operator bearer token, with exact issuer, JWKS URI, audience(s), and role claim mapping. Do not derive Keycloak’s `/realms/{realm}/protocol/openid-connect/certs` path for arbitrary providers.
 - Preserve `is_org_admin` mapping to the complete admin-default bundle and keep `ENHANCED_ORG_ADMIN=False` so Koku still consults Insights RBAC.
@@ -216,6 +216,7 @@ Final CRD field names are implementation decisions; the API should describe gene
 - Reject missing/invalid tenant ID or account mapping; never fall back to a shared tenant/account.
 - Replace any incoming `X-Rh-Identity`; backends must not be reachable through an untrusted route that bypasses Envoy.
 - Map only the explicitly configured admin claim/value; do not treat arbitrary group claims as administrator status.
+- Apply the configured service identity only when the service-token marker matches; treat any other token on the service header as a user token, which fails closed without user claims (WHY: header position alone must not confer service identity).
 - Keep `ENHANCED_ORG_ADMIN=False`; `is_org_admin` should activate Insights RBAC admin-default permissions, not bypass RBAC.
 - Define and audit behavior for removal from the admin app-role group; revocation is reflected on newly issued tokens plus the relevant cache/token-expiry delay.
 - If a SCIM provisioning follow-up is implemented, use least-privilege authentication, protected credentials, TLS verification, and safe deprovisioning that only prunes after a complete successful reconciliation.
