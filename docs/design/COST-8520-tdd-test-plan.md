@@ -18,6 +18,7 @@
 - Decision: Envoy validates a Cost Management API **access token** for UI API requests, matching the token category used at the Hybrid Cloud Console API boundary. Migrate the current Keycloak UI path to this contract; its observed ID-token behavior is a baseline to characterize, not a mode to preserve.
 - Backend services continue receiving the existing `X-Rh-Identity` contract; caller-provided identity headers are not trusted.
 - Entra `tid` maps to `org_id` with hyphens stripped (32 hex chars), only under the one-Entra-tenant-to-one-Cost-Management-org assumption; `account_number` is mapped independently.
+- The initial one-org mapping is a proposed OIDC deployment scope, not proof that all current Keycloak on-prem installations are single-org. Its enforcement and compatibility with existing Keycloak behavior must be decided and tested before implementation; multi-org data-plane fixes remain separate work.
 - No CRD backwards compatibility: `spec.auth.keycloak` is deleted; Keycloak is tested as a generic OIDC profile. Old CRs must be rejected with a message naming `spec.auth.oidc`.
 - SCIM/Graph principal provisioning is not implemented or tested in this plan. Integration tests seed or provision RBAC Principals through an already-supported test/setup path.
 - Full-stack support is claimed only for providers that pass user login, API access-token audience/claim, admin-role, and Metrics Operator token/upload checks.
@@ -39,6 +40,7 @@
 4. The Entra admin role must map to the full RBAC admin-default bundle; non-admin roles must remain scoped and must not inherit admin access.
 5. Metrics Operator service tokens use the Cost Management API audience and configured scope; token identity must not accidentally gain user-admin privileges.
 6. No backwards compatibility: old Keycloak-field CRs are rejected explicitly, Keycloak works through the generic OIDC profile, and external OIDC operation must not require Keycloak resources or APIs.
+7. **Tenant-cache collision:** Koku's actual `_get_tenant` caches by username alone; an offline extracted-method probe returned org A's tenant for the same username in org B. The SNO image contains the same method. This is not a demonstrated live data leak; do not treat mapping-table tests or distinct usernames as proof of multi-org isolation.
 
 ---
 
@@ -135,7 +137,8 @@
 - **Non-admin:** absence of admin role → regular Insights RBAC lookup; seeded viewer permissions allow only configured resource/verb access and denied resources remain filtered/blocked.
 - **Revocation:** remove admin app-role membership, issue a fresh token, and verify admin-default access is absent after provider propagation and the effective Koku/Insights RBAC cache bounds.
 - **Operator upload:** use a mock token endpoint to issue a service access token with the API audience and configured scope, send an upload through Envoy to Ingress, and verify identity/tenant/account mapping. The service identity never receives the human admin role.
-- **Tenant isolation:** two tenant fixtures cannot read each other’s data; an Entra `tid` maps as `org_id` with hyphens stripped, only under the documented one-to-one mapping.
+- **Initial mapping boundary:** an Entra `tid` maps as `org_id` with hyphens stripped under the one-to-one mapping. After the enforcement/Keycloak-parity decision, test a trusted token mapped outside the configured org/account as well as missing/malformed values: it must be rejected at the decided boundary before tenant creation or backend mutation. If that decision would restrict currently supported Keycloak behavior, stop for owner approval instead of silently shipping a regression.
+- **Separate Koku data-plane isolation gate:** using isolated backend fixtures, create org A and B with distinct accounts, distinct sentinel rows, and the **same username/stable principal**. Exercise A→B and B→A, warm-cache and fresh-cache requests, and assert the actual selected schema, returned data, and RBAC permissions belong only to the requested org. A distinct-username test or a 403 alone cannot prove this; backend fixtures do not certify a live gateway/RBAC integration. The current extracted `_get_tenant` collision must be independently investigated and resolved or explicitly dispositioned before a multi-org support claim; this is separate Koku work, not an authorized OIDC production change. Once a future gateway multi-org mapping exists, repeat the same cases through the actual gateway and RBAC.
 - **Failure:** wrong issuer/audience, ID token instead of API access token, user token presented on the service-token header, invalid signature, expired token, missing org/account mapping, invalid TLS, and RBAC unavailable all fail according to the fail-closed contract.
 - **Keycloak profile:** a Keycloak realm configured through the generic OIDC fields (Keycloak issuer/JWKS/audiences, `realm_access.roles` claim path, access-token mappers, dedicated API audience distinct from the UI client_id) passes the same login, API-audience, admin-role, and upload checks as Entra; old `spec.auth.keycloak` CRs are rejected with a message naming `spec.auth.oidc`.
 
@@ -156,3 +159,4 @@
 5. DECIDED: old Keycloak CR configuration is rejected with a message naming `spec.auth.oidc`; no legacy support.
 6. Confirm the Entra API audience, UI delegated scope, organization-admin app-role value, and Metrics Operator application permission/scope.
 7. Confirm SCIM remains a dependent follow-up and not part of COST-8520 implementation.
+8. Decide how the proposed initial one-org mapping is enforced for all supported providers after characterizing Keycloak parity; define the rejection point and avoid silently removing an existing supported capability.
